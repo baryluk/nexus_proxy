@@ -188,7 +188,7 @@ func handleMiss(w http.ResponseWriter, r *http.Request, reponame string, repo *R
 		err := cacheTemp.Cleanup()
 		if err != nil {
 			error_count.Inc()
-			log.Printf("FIN %s   - %q Sending response or saving to cache filed, and temporary file cleanup failed. Error: %v", r.RemoteAddr, path, err)
+			log.Printf("FIN %s   - %q Sending response or saving to cache failed, and temporary file cleanup failed. Error: %v", r.RemoteAddr, path, err)
 		}
 		update_free_disk_space()
 	}()
@@ -205,6 +205,7 @@ func handleMiss(w http.ResponseWriter, r *http.Request, reponame string, repo *R
 	bytesCopiedCount := 0
 	buf := make([]byte, BUFFERSIZE)
 	abandonCacheFile := false
+	abandonClientWrite := false
 	for {
 		n, err := resp.Body.Read(buf)
 		if err != nil && err != io.EOF {
@@ -214,10 +215,12 @@ func handleMiss(w http.ResponseWriter, r *http.Request, reponame string, repo *R
 		if n == 0 {
 			break
 		}
-		if _, err := w.Write(buf[:n]); err != nil {
-			error_count.Inc()
-			log.Printf("END %s 5xx %q Cache miss and writing to socket failed after %d bytes, aborting response and cache write. Error: %v", r.RemoteAddr, path, bytesCopiedCount, err)
-			panic(http.ErrAbortHandler)
+		if !abandonClientWrite {
+			if n1, err := w.Write(buf[:n]); err != nil || n1 != n {
+				error_count.Inc()
+				log.Printf("MID %s 5xx %q Cache miss and writing to socket failed after %d bytes, aborting response write, but continue with fetching to disk. Error: %v", r.RemoteAddr, path, bytesCopiedCount, err)
+				abandonClientWrite = true
+			}
 		}
 		if !abandonCacheFile {
 			if n2, err := cacheTemp.File().Write(buf[:n]); err != nil || n2 != n {
@@ -225,6 +228,10 @@ func handleMiss(w http.ResponseWriter, r *http.Request, reponame string, repo *R
 				log.Printf("MID0 %s 200 %q Cache miss and write error to cache file after %d bytes. Attempted to write %d bytes, wrote %d bytes. Error: %v", r.RemoteAddr, path, bytesCopiedCount, n, n2, err)
 				abandonCacheFile = true
 			}
+		}
+		if abandonClientWrite && abandonCacheFile {
+			log.Printf("END %s 5xx %q Cache miss and write error to both client and cache file about %d bytes. Aborting handler (will also cleanup temporary file) after %v", r.RemoteAddr, path, bytesCopiedCount, time.Since(t1))
+			panic(http.ErrAbortHandler)
 		}
 		bytesCopiedCount += n
 	}
